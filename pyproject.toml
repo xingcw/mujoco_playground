@@ -26,13 +26,16 @@ dependencies = [
     "brax>=0.14.2",
     "etils",
     "flax",
-    "jax",
+    # Pinned to 0.6.2 to match the GPU host build while we test whether the
+    # TPU training regression is caused by a newer jax version.
+    "jax==0.6.2",
     "lxml",
     "mediapy",
     "ml_collections",
     "mujoco-mjx>=3.6.0",
     "mujoco>=3.6.0",
-    "warp-lang>=1.11",
+    # warp-lang is CUDA-only and not needed for the JAX MJX path on TPU.
+    # Re-add as an optional extra if you need the Warp backend on a GPU host.
     "orbax-checkpoint>=0.11.22",
     "tqdm",
 ]
@@ -40,7 +43,10 @@ keywords = ["mjx", "mujoco", "sim2real", "reinforcement learning"]
 
 [project.optional-dependencies]
 cuda = [
-    "jax[cuda12]",
+    "jax[cuda12]==0.6.2",
+]
+tpu = [
+    "jax[tpu]==0.6.2",
 ]
 test = [
     "absl-py",
