@@ -50,11 +50,19 @@ except ImportError:
   wandb = None
 
 
-xla_flags = os.environ.get("XLA_FLAGS", "")
-xla_flags += " --xla_gpu_triton_gemm_any=True"
-os.environ["XLA_FLAGS"] = xla_flags
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["MUJOCO_GL"] = "egl"
+# GPU-specific XLA tuning and the EGL rendering backend are skipped here so the
+# script works on TPU/CPU hosts that have no NVIDIA driver. On a GPU host you
+# can re-export them externally, e.g.:
+#   XLA_FLAGS=--xla_gpu_triton_gemm_any=True MUJOCO_GL=egl python train_jax_ppo.py ...
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# osmesa is a software GL fallback; only exercised if --record_video is set.
+os.environ.setdefault("MUJOCO_GL", "osmesa")
+
+# Note: brax PPO already exposes `normalize_until_count` (passed through to
+# running_statistics.update); we plumb it via the --normalize_until_count flag
+# below. The Welford branch of running_statistics needs the companion patch in
+# brax_running_statistics.patch to honor `until_count` (upstream brax only
+# honors it in EMA mode).
 
 # Ignore the info logs from brax
 logging.set_verbosity(logging.WARNING)
@@ -105,6 +113,13 @@ _NUM_TIMESTEPS = flags.DEFINE_integer(
 )
 _NUM_VIDEOS = flags.DEFINE_integer(
     "num_videos", 1, "Number of videos to record after training."
+)
+_RECORD_VIDEO = flags.DEFINE_boolean(
+    "record_video",
+    False,
+    "Render rollout videos after training. Requires a working MuJoCo GL"
+    " backend (EGL on NVIDIA, OSMesa as a software fallback). Off by default"
+    " so the script runs cleanly on TPU/CPU hosts.",
 )
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
@@ -173,6 +188,14 @@ _TRAINING_METRICS_STEPS = flags.DEFINE_integer(
     "Number of steps between logging training metrics. Increase if training"
     " experiences slowdown.",
 )
+_NORMALIZE_UNTIL_COUNT = flags.DEFINE_integer(
+    "normalize_until_count",
+    None,
+    "If set, brax PPO freezes the obs running statistics after this many"
+    " samples have been seen. Tests whether late-stage Welford precision drift"
+    " causes the TPU reward decay. Requires the Welford-honors-until_count"
+    " patch to brax's running_statistics.py (no effect on EMA mode upstream).",
+)
 _WARP_KERNEL_CACHE_DIR = flags.DEFINE_string(
     "warp_kernel_cache_dir", None,
     "Directory for caching compiled Warp kernels.",
@@ -221,6 +244,10 @@ def main(argv):
   """Run training and evaluation for the specified environment."""
 
   del argv
+
+  print(
+      f"JAX backend: {jax.default_backend()}  devices: {jax.devices()}"
+  )
 
   if _WARP_KERNEL_CACHE_DIR.value is not None:
     import warp as wp  # pylint: disable=g-import-not-at-top
@@ -296,6 +323,12 @@ def main(argv):
     ppo_params.log_training_metrics = _LOG_TRAINING_METRICS.value
   if _TRAINING_METRICS_STEPS.present:
     ppo_params.training_metrics_steps = _TRAINING_METRICS_STEPS.value
+  if _NORMALIZE_UNTIL_COUNT.present:
+    ppo_params.normalize_until_count = _NORMALIZE_UNTIL_COUNT.value
+    print(
+        "[TPU-DIAG] obs-running-stats will freeze after"
+        f" {_NORMALIZE_UNTIL_COUNT.value} samples"
+    )
 
   print(f"Environment Config:\n{env_cfg}")
   if env_cfg_overrides:
@@ -411,7 +444,10 @@ def main(argv):
       for key, value in metrics.items():
         writer.add_scalar(key, value, num_steps)
       writer.flush()
-    if _RUN_EVALS.value:
+    # progress() fires both from eval rollouts (metrics has 'eval/...') and
+    # from --log_training_metrics callbacks (metrics has only 'episode/...').
+    # Guard on key presence so the training-metrics path doesn't KeyError.
+    if _RUN_EVALS.value and "eval/episode_reward" in metrics:
       print(f"{num_steps}: reward={metrics['eval/episode_reward']:.3f}")
     if _LOG_TRAINING_METRICS.value:
       if "episode/sum_reward" in metrics:
@@ -419,6 +455,16 @@ def main(argv):
             f"{num_steps}: mean episode"
             f" reward={metrics['episode/sum_reward']:.3f}"
         )
+      # Surface diagnostic training metrics so they appear in train.log (not
+      # just wandb/tb). Brax wraps the PPO loss dict with prefix 'training/'.
+      for k in (
+          "training/v_loss",
+          "training/policy_loss",
+          "training/entropy_loss",
+          "training/kl_mean",
+      ):
+        if k in metrics:
+          print(f"  {k} = {float(metrics[k]):.4g}")
 
   eval_env_overrides = dict(env_cfg_overrides)
   if _VISION.value:
@@ -473,6 +519,13 @@ def main(argv):
   if len(times) > 1:
     print(f"Time to JIT compile: {times[1] - times[0]}")
     print(f"Time to train: {times[-1] - times[1]}")
+
+  if not _RECORD_VIDEO.value or _NUM_VIDEOS.value <= 0:
+    print(
+        "Skipping post-training rollout/video rendering"
+        " (pass --record_video to enable; requires a MuJoCo GL backend)."
+    )
+    return
 
   print("Starting inference...")
 
