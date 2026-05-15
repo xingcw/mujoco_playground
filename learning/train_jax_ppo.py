@@ -121,6 +121,21 @@ _RECORD_VIDEO = flags.DEFINE_boolean(
     " backend (EGL on NVIDIA, OSMesa as a software fallback). Off by default"
     " so the script runs cleanly on TPU/CPU hosts.",
 )
+_RENDER_HTML = flags.DEFINE_boolean(
+    "render_html",
+    False,
+    "Render an interactive brax HTML viewer per rollout after training. Uses"
+    " brax.io.html — no GPU/pixel rendering required, so it works on TPU/CPU"
+    " hosts where --record_video can't run.",
+)
+_HTML_TARGET_FRAMES = flags.DEFINE_integer(
+    "html_target_frames",
+    500,
+    "Target number of frames after subsampling the rollout for HTML render.",
+)
+_HTML_HEIGHT = flags.DEFINE_integer(
+    "html_height", 480, "HTML viewer height in pixels."
+)
 _NUM_EVALS = flags.DEFINE_integer("num_evals", 5, "Number of evaluations")
 _REWARD_SCALING = flags.DEFINE_float("reward_scaling", 0.1, "Reward scaling")
 _EPISODE_LENGTH = flags.DEFINE_integer("episode_length", 1000, "Episode length")
@@ -387,9 +402,13 @@ def main(argv):
   ckpt_path.mkdir(parents=True, exist_ok=True)
   print(f"Checkpoint path: {ckpt_path}")
 
-  # Save environment configuration
+  # Save environment configuration. Mirrored at the run-dir root so the
+  # mjx_viz dashboard (unified mode) can serve it via /api/runs/<run>/config.
+  env_cfg_dict = env_cfg.to_dict()
   with open(ckpt_path / "config.json", "w", encoding="utf-8") as fp:
-    json.dump(env_cfg.to_dict(), fp, indent=4)
+    json.dump(env_cfg_dict, fp, indent=4)
+  with open(logdir / "config.json", "w", encoding="utf-8") as fp:
+    json.dump(env_cfg_dict, fp, indent=4)
 
   training_params = dict(ppo_params)
   if "network_factory" in training_params:
@@ -520,10 +539,13 @@ def main(argv):
     print(f"Time to JIT compile: {times[1] - times[0]}")
     print(f"Time to train: {times[-1] - times[1]}")
 
-  if not _RECORD_VIDEO.value or _NUM_VIDEOS.value <= 0:
+  if (
+      (not _RECORD_VIDEO.value and not _RENDER_HTML.value)
+      or _NUM_VIDEOS.value <= 0
+  ):
     print(
-        "Skipping post-training rollout/video rendering"
-        " (pass --record_video to enable; requires a MuJoCo GL backend)."
+        "Skipping post-training rollout (pass --record_video for MP4 — needs"
+        " a MuJoCo GL backend — or --render_html for the GPU-free brax viewer)."
     )
     return
 
@@ -574,6 +596,8 @@ def main(argv):
         "data.mocap_pos": state.data.mocap_pos,
         "data.mocap_quat": state.data.mocap_quat,
         "data.xfrc_applied": state.data.xfrc_applied,
+        "data.xpos": state.data.xpos,
+        "data.xquat": state.data.xquat,
     })
     return (state, rng), traj_data
 
@@ -596,20 +620,48 @@ def main(argv):
     ]
 
   # Render and save the rollout.
-  render_every = 2
-  fps = 1.0 / infer_env.dt / render_every
-  print(f"FPS for rendering: {fps}")
-  scene_option = mujoco.MjvOption()
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
-  scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
-  for i, rollout in enumerate(trajectories):
-    traj = rollout[::render_every]
-    frames = infer_env.render(
-        traj, height=480, width=640, scene_option=scene_option
-    )
-    media.write_video(logdir / f"rollout{i}.mp4", frames, fps=fps)
-    print(f"Rollout video saved as '{logdir}/rollout{i}.mp4'.")
+  if _RECORD_VIDEO.value:
+    render_every = 2
+    fps = 1.0 / infer_env.dt / render_every
+    print(f"FPS for rendering: {fps}")
+    scene_option = mujoco.MjvOption()
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
+    for i, rollout in enumerate(trajectories):
+      traj = rollout[::render_every]
+      frames = infer_env.render(
+          traj, height=480, width=640, scene_option=scene_option
+      )
+      media.write_video(logdir / f"rollout{i}.mp4", frames, fps=fps)
+      print(f"Rollout video saved as '{logdir}/rollout{i}.mp4'.")
+
+  if _RENDER_HTML.value:
+    from mjx_viz import render_brax_html, write_html  # pylint: disable=g-import-not-at-top
+    import numpy as np  # pylint: disable=g-import-not-at-top
+    # xpos/xquat come from the same scan above (shape: (nworld, time, nbody,
+    # ...)). Drop the world body before handing to mjx_viz, which expects
+    # per-link arrays.
+    xpos_all = np.asarray(traj_stacked.data.xpos)
+    xquat_all = np.asarray(traj_stacked.data.xquat)
+    # mjx_viz unified layout: <run>/rollouts/final/*.html for the post-training
+    # rollout. Pair with `mjx-viz-dashboard --runs-dir <parent_of_logdir>`.
+    rollout_dir = logdir / "rollouts" / "final"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(_NUM_VIDEOS.value):
+      html_str = render_brax_html(
+          infer_env.mj_model,
+          xpos_all[i, :, 1:],
+          xquat_all[i, :, 1:],
+          height=f"{int(_HTML_HEIGHT.value)}px",
+          max_frames=_HTML_TARGET_FRAMES.value,
+          frame_dt=float(infer_env.dt),
+      )
+      if html_str is None:
+        continue
+      html_path = rollout_dir / f"rollout{i}.html"
+      write_html(str(html_path), html_str)
+      print(f"Rollout HTML saved as '{html_path}'.")
 
 
 def run():

@@ -1,0 +1,3 @@
+[submodule "mjx_viz"]
+	path = mjx_viz
+	url = https://github.com/xingcw/mjx_viz.git

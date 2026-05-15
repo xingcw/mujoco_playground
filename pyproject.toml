@@ -32,6 +32,7 @@ dependencies = [
     "lxml",
     "mediapy",
     "ml_collections",
+    "mjx-viz",
     "mujoco-mjx>=3.6.0",
     "mujoco>=3.6.0",
     # warp-lang is CUDA-only and not needed for the JAX MJX path on TPU.
@@ -72,12 +73,19 @@ learning = [
     "rsl-rl-lib>=3.0.0",
     "wandb",
 ]
+dashboard = [
+    "mjx-viz[dashboard]",
+]
 all = [
     "playground[dev]",
     "playground[cuda]",
     "playground[notebooks]",
     "playground[learning]",
+    "playground[dashboard]",
 ]
+
+[tool.uv.sources]
+mjx-viz = { path = "mjx_viz" }
 
 [tool.hatch.metadata]
 allow-direct-references = true
